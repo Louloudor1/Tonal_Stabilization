@@ -12,13 +12,11 @@ requires-python = ">=3.10, <3.14"
 readme = "README.md"
 dependencies = [
     "pandas[parquet]>=2,<3",
-    "nicegui[native]>=2,<3",
     "pyside6"
 ]
 
 
 [project.scripts]
-main_ng = "tonal_stabilization.main_nicegui:run"
 main_qt = "tonal_stabilization.main_qt:run"
 
 [dependency-groups]
