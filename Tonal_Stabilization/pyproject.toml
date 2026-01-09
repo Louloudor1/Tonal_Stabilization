@@ -1,0 +1,74 @@
+[project]
+name = "Tonal_Stabilization"
+version = "0.1.0"
+description = ""
+
+authors = [
+    { name = "Paolo Cheype"},
+    { name = " Louis Dorlencourt"},
+    
+]
+requires-python = ">=3.10, <3.14"
+readme = "README.md"
+dependencies = [
+    "pandas[parquet]>=2,<3",
+    "nicegui[native]>=2,<3",
+    "pyside6"
+]
+
+
+[project.scripts]
+main_ng = "tonal_stabilization.main_nicegui:run"
+main_qt = "tonal_stabilization.main_qt:run"
+
+[dependency-groups]
+test = [
+    "pytest",
+    "coverage",
+    "pandas-stubs",
+    "pytest-sugar",
+]
+docs = [
+    "Sphinx",
+    "pydata-sphinx-theme",
+    "myst-parser",
+    "jupyter",
+    "nbsphinx",
+    "sphinx-copybutton",
+    "sphinx-autobuild",
+    "ipython",
+    "sphinx-favicon",
+    "sphinx-argparse",
+]
+
+[tool.uv]
+default-groups = [
+    "test",
+    "docs",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["tonal_stabilization"]
+
+[tool.hatch.build.targets.wheel]
+include = ["tonal_stabilization"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pydoclint]
+style = 'google'
+arg-type-hints-in-docstring = false
+skip-checking-raises = true
+allow-init-docstring = true
+check-return-types = false
+check-yield-types = false
+
+[tool.pytest.ini_options]
+doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
+addopts = "--import-mode=importlib --doctest-modules"
+testpaths = ["test_tonal_stabilization", "tonal_stabilization"]
+
+[tool.coverage.run]
+source = ["tonal_stabilization"]
