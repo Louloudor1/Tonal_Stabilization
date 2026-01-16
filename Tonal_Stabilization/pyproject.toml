@@ -3,21 +3,20 @@ name = "Tonal_Stabilization"
 version = "0.1.0"
 description = ""
 
-authors = [
-    { name = "Paolo Cheype"},
-    { name = " Louis Dorlencourt"},
-    
-]
+authors = [{name ="Paolo Cheype, Louis Dorlencourt"}]
+
 requires-python = ">=3.10, <3.14"
 readme = "README.md"
 dependencies = [
     "pandas[parquet]>=2,<3",
-    "pyside6"
+    "pyside6",
+    "matplotlib",
+    "numpy"
 ]
 
 
 [project.scripts]
-main_qt = "tonal_stabilization.main_qt:run"
+tonal_stabilization = "tonal_stabilization.main_process:main"
 
 [dependency-groups]
 test = [

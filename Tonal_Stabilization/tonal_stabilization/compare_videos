@@ -1,0 +1,107 @@
+import cv2
+import numpy as np
+import os
+
+
+def open_video(path):
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise IOError(f"Impossible d'ouvrir la vidéo: {path}")
+    return cap
+
+
+def get_video_info(cap):
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    n   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    return fps, w, h, n
+
+
+def compare_videos(video_a, video_b, resize_to=None, window_name="Comparison"):
+    cap_a = open_video(video_a)
+    cap_b = open_video(video_b)
+
+    fps_a, wa, ha, na = get_video_info(cap_a)
+    fps_b, wb, hb, nb = get_video_info(cap_b)
+
+    fps = min(fps_a, fps_b)
+    delay = max(1, int(1000 / fps))
+
+    print("[INFO] Vidéo A:", os.path.basename(video_a), f"{wa}x{ha}  FPS={fps_a:.1f}")
+    print("[INFO] Vidéo B:", os.path.basename(video_b), f"{wb}x{hb}  FPS={fps_b:.1f}")
+    print("[INFO] FPS lecture:", fps)
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    paused = False
+    frame_idx = 0
+
+    while True:
+        if not paused:
+            ret_a, fa = cap_a.read()
+            ret_b, fb = cap_b.read()
+
+            if not ret_a or not ret_b:
+                print("[INFO] Fin d'une des vidéos.")
+                break
+
+            if resize_to is not None:
+                fa = cv2.resize(fa, resize_to, interpolation=cv2.INTER_AREA)
+                fb = cv2.resize(fb, resize_to, interpolation=cv2.INTER_AREA)
+
+            # Assure même hauteur
+            if fa.shape[0] != fb.shape[0]:
+                h = min(fa.shape[0], fb.shape[0])
+                fa = cv2.resize(fa, (int(fa.shape[1]*h/fa.shape[0]), h))
+                fb = cv2.resize(fb, (int(fb.shape[1]*h/fb.shape[0]), h))
+
+            # Concat horizontale
+            combined = np.hstack([fa, fb])
+
+            # Overlay texte
+            cv2.putText(combined, "ORIGINAL", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(combined, "STABILIZED", (fa.shape[1] + 20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+
+            cv2.putText(combined, f"Frame {frame_idx}",
+                        (20, combined.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            cv2.imshow(window_name, combined)
+            frame_idx += 1
+
+        key = cv2.waitKey(delay) & 0xFF
+
+        if key in (27, ord('q')):   # ESC / q
+            break
+        elif key == ord(' '):       # pause
+            paused = not paused
+        elif key == ord('r'):       # restart
+            cap_a.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            cap_b.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            frame_idx = 0
+        elif key == ord('a'):       # frame arrière
+            pos = max(frame_idx - 2, 0)
+            cap_a.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            cap_b.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            frame_idx = pos
+        elif key == ord('d'):       # frame avant
+            pass
+
+    cap_a.release()
+    cap_b.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    VIDEO_ORIG = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/graycard.mp4"
+    VIDEO_STAB = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/graycard_stabilized.mp4"
+
+    compare_videos(
+        VIDEO_ORIG,
+        VIDEO_STAB,
+        resize_to=None  # ex: (640, 360) si trop grand
+    )
+ 
