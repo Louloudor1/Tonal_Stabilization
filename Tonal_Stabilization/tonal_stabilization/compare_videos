@@ -18,90 +18,147 @@ def get_video_info(cap):
     return fps, w, h, n
 
 
-def compare_videos(video_a, video_b, resize_to=None, window_name="Comparison"):
-    cap_a = open_video(video_a)
-    cap_b = open_video(video_b)
+def ensure_same_size(a, b, resize_to=None):
+    if resize_to is not None:
+        a = cv2.resize(a, resize_to, interpolation=cv2.INTER_AREA)
+        b = cv2.resize(b, resize_to, interpolation=cv2.INTER_AREA)
 
-    fps_a, wa, ha, na = get_video_info(cap_a)
-    fps_b, wb, hb, nb = get_video_info(cap_b)
+    ha, wa = a.shape[:2]
+    hb, wb = b.shape[:2]
+    h = min(ha, hb)
+    w = min(wa, wb)
 
-    fps = min(fps_a, fps_b)
+    return a[:h, :w], b[:h, :w]
+
+
+def diagonal_composite(orig_bgr, stab_bgr, diag="\\", line_thickness=2):
+    """
+    Composite diagonal:
+      - ORIGINAL en bas-gauche
+      - STABILIZED en haut-droit
+
+    diag="\\": séparation haut-gauche -> bas-droit
+    """
+    h, w = orig_bgr.shape[:2]
+    yy, xx = np.indices((h, w), dtype=np.float32)
+
+    # Diagonale "\" : y = (h-1)/(w-1) * x
+    m = (h - 1) / max((w - 1), 1)
+    boundary = m * xx
+
+    # bas-gauche = y > boundary
+    mask_orig = yy > boundary
+    mask_stab = ~mask_orig
+
+    out = np.empty_like(orig_bgr)
+    out[mask_orig] = orig_bgr[mask_orig]
+    out[mask_stab] = stab_bgr[mask_stab]
+
+    # Trait de séparation
+    dist = np.abs(yy - boundary)
+    line_mask = dist <= line_thickness
+    out[line_mask] = (255, 255, 255)
+
+    return out
+
+
+def draw_labels(img_bgr):
+    h, w = img_bgr.shape[:2]
+    cv2.putText(img_bgr, "ORIGINAL", (20, h - 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(img_bgr, "STABILIZED", (max(w - 220, 20), 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
+    return img_bgr
+
+
+def compare_videos_diagonal(video_orig, video_stab, resize_to=None,
+                            window_name="Diagonal Comparison", diag="\\",
+                            output_path="comparison.mp4"):
+    cap_o = open_video(video_orig)
+    cap_s = open_video(video_stab)
+
+    fps_o, wo, ho, no = get_video_info(cap_o)
+    fps_s, ws, hs, ns = get_video_info(cap_s)
+
+    fps = min(fps_o, fps_s) if fps_o > 0 and fps_s > 0 else 30.0
     delay = max(1, int(1000 / fps))
 
-    print("[INFO] Vidéo A:", os.path.basename(video_a), f"{wa}x{ha}  FPS={fps_a:.1f}")
-    print("[INFO] Vidéo B:", os.path.basename(video_b), f"{wb}x{hb}  FPS={fps_b:.1f}")
+    print("[INFO] Orig:", os.path.basename(video_orig), f"{wo}x{ho}  FPS={fps_o:.1f}")
+    print("[INFO] Stab:", os.path.basename(video_stab), f"{ws}x{hs}  FPS={fps_s:.1f}")
     print("[INFO] FPS lecture:", fps)
+    print("[INFO] Diagonale:", diag)
 
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     paused = False
     frame_idx = 0
 
+    out = None  # VideoWriter (initialisé au 1er frame, quand on connaît la taille)
+
     while True:
         if not paused:
-            ret_a, fa = cap_a.read()
-            ret_b, fb = cap_b.read()
+            ret_o, fo = cap_o.read()
+            ret_s, fs = cap_s.read()
 
-            if not ret_a or not ret_b:
+            if not ret_o or not ret_s:
                 print("[INFO] Fin d'une des vidéos.")
                 break
 
-            if resize_to is not None:
-                fa = cv2.resize(fa, resize_to, interpolation=cv2.INTER_AREA)
-                fb = cv2.resize(fb, resize_to, interpolation=cv2.INTER_AREA)
+            fo, fs = ensure_same_size(fo, fs, resize_to=resize_to)
 
-            # Assure même hauteur
-            if fa.shape[0] != fb.shape[0]:
-                h = min(fa.shape[0], fb.shape[0])
-                fa = cv2.resize(fa, (int(fa.shape[1]*h/fa.shape[0]), h))
-                fb = cv2.resize(fb, (int(fb.shape[1]*h/fb.shape[0]), h))
-
-            # Concat horizontale
-            combined = np.hstack([fa, fb])
-
-            # Overlay texte
-            cv2.putText(combined, "ORIGINAL", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(combined, "STABILIZED", (fa.shape[1] + 20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+            combined = diagonal_composite(fo, fs, diag=diag, line_thickness=1)
+            combined = draw_labels(combined)
 
             cv2.putText(combined, f"Frame {frame_idx}",
-                        (20, combined.shape[0] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                        (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # --- Initialisation de l'enregistreur au premier frame (taille connue ici)
+            if out is None:
+                h, w = combined.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+                if not out.isOpened():
+                    raise IOError(f"Impossible d'ouvrir le writer: {output_path}")
+                print(f"[INFO] Enregistrement vidéo -> {output_path} ({w}x{h} @ {fps:.2f} fps)")
 
             cv2.imshow(window_name, combined)
+
+            out.write(combined)  # ✅ enregistre le frame de comparaison
+
             frame_idx += 1
 
         key = cv2.waitKey(delay) & 0xFF
 
-        if key in (27, ord('q')):   # ESC / q
+        if key in (27, ord('q')):
             break
-        elif key == ord(' '):       # pause
+        elif key == ord(' '):
             paused = not paused
-        elif key == ord('r'):       # restart
-            cap_a.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            cap_b.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        elif key == ord('r'):
+            cap_o.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            cap_s.set(cv2.CAP_PROP_POS_FRAMES, 0)
             frame_idx = 0
-        elif key == ord('a'):       # frame arrière
+        elif key == ord('a'):
             pos = max(frame_idx - 2, 0)
-            cap_a.set(cv2.CAP_PROP_POS_FRAMES, pos)
-            cap_b.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            cap_o.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            cap_s.set(cv2.CAP_PROP_POS_FRAMES, pos)
             frame_idx = pos
-        elif key == ord('d'):       # frame avant
-            pass
 
-    cap_a.release()
-    cap_b.release()
+    cap_o.release()
+    cap_s.release()
+    if out is not None:
+        out.release()
     cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    VIDEO_ORIG = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/graycard.mp4"
-    VIDEO_STAB = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/graycard_stabilized.mp4"
+    VIDEO_ORIG = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/weirdhouse.mp4"
+    VIDEO_STAB = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/weirdhouse_stabilized.mp4"
 
-    compare_videos(
+    compare_videos_diagonal(
         VIDEO_ORIG,
         VIDEO_STAB,
-        resize_to=None  # ex: (640, 360) si trop grand
+        resize_to=None,
+        diag="\\",
+        output_path="/Users/louisdorlencourt/Documents/Documents/3A/TIVO/weirdhouse_comparison.mp4"  # change ici si tu veux un autre nom/chemin
     )
- 

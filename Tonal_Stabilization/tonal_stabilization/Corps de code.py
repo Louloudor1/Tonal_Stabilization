@@ -1,358 +1,388 @@
-import os
-import glob
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Implémentation *fidèle* à l'algorithme (Alg. 1) du papier FRIGO 2015
+(stabilisation tonale via mouvement dominant + correction paramétrique).
+
+Chemins demandés :
+"""
+
 import cv2
 import numpy as np
+import math
+
+VIDEO_ORIG = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/graycard.mp4"
+VIDEO_STAB = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/graycard_stabilized.mp4"
 
 
-# -------------------------
-# I/O: sequence d'images
-# -------------------------
-def list_images(folder, exts=("png", "jpg", "jpeg", "bmp", "tif", "tiff")):
-    paths = []
-    for ext in exts:
-        paths += glob.glob(os.path.join(folder, f"*.{ext}"))
-        paths += glob.glob(os.path.join(folder, f"*.{ext.upper()}"))
-    paths.sort()
-    return paths
+# =========================
+# Paramètres du papier
+# =========================
+# largeur de travail pour l'estimation (papier : 120 px)
+WORK_W = 120
+
+# (6) seuil sur la similarité couleur centrée (dans [0,1])
+SIGMA = 0.10
+
+# (Alg.1 l.5) proportion minimale : |Ω_{t,k}| >= ω * |Ω|
+OMEGA_FRAC = 0.70
+
+# (7) lambda = lambda0 * exp(-||V_{t,k}|| / p)
+LAMBDA0 = 0.90
 
 
-def read_image_float01(path):
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is None:
-        return None
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return (img.astype(np.float32) / 255.0)
+# =========================
+# Utils
+# =========================
+def resize_keep_aspect(bgr, w):
+    h, W = bgr.shape[:2]
+    if W == w:
+        return bgr
+    new_h = int(round(h * (w / float(W))))
+    return cv2.resize(bgr, (w, new_h), interpolation=cv2.INTER_AREA)
 
+def to_float01(bgr):
+    return bgr.astype(np.float32) / 255.0
 
-def write_mp4(frames_rgb01, out_path, fps):
-    if not frames_rgb01:
-        raise ValueError("Aucune frame à écrire.")
-    h, w = frames_rgb01[0].shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-    if not writer.isOpened():
-        raise RuntimeError("VideoWriter mp4v ne s'ouvre pas. Essaie AVI/MJPG si besoin.")
-
-    for f in frames_rgb01:
-        f8 = np.clip(f * 255.0, 0, 255).astype(np.uint8)
-        bgr = cv2.cvtColor(f8, cv2.COLOR_RGB2BGR)
-        writer.write(bgr)
-
-    writer.release()
-    print(f"[OK] Vidéo écrite: {os.path.abspath(out_path)}")
-
-
-# -------------------------
-# Utils: resize estimation
-# -------------------------
-def resize_for_estimation(img_rgb01, target_width=160):
-    h, w = img_rgb01.shape[:2]
-    if w <= target_width:
-        return img_rgb01
-    scale = target_width / float(w)
-    nh = int(round(h * scale))
-    out = cv2.resize(img_rgb01, (target_width, nh), interpolation=cv2.INTER_AREA)
-    return out
-
-
-# -------------------------
-# Mouvement: Harris + LK + RANSAC affine partielle
-# -------------------------
-def harris_points(gray, max_pts=400, quality=0.01, min_dist=7):
+def estimate_affine_dominant_motion(prev_gray, curr_gray):
     """
-    Utilise goodFeaturesToTrack (Shi-Tomasi) par défaut (très proche en pratique),
-    robuste et rapide. Si tu veux strictement Harris, on met useHarrisDetector=True.
+    Estimation du mouvement dominant (affine) entre (t-1)->t.
+    Retourne M 3x3 (homogène).
     """
-    pts = cv2.goodFeaturesToTrack(
-        gray,
-        maxCorners=max_pts,
-        qualityLevel=quality,
-        minDistance=min_dist,
-        useHarrisDetector=True,
-        k=0.04
+    # points à suivre
+    p0 = cv2.goodFeaturesToTrack(
+        prev_gray,
+        maxCorners=800,
+        qualityLevel=0.01,
+        minDistance=8,
+        blockSize=7
     )
-    if pts is None:
-        return None
-    return pts.reshape(-1, 2).astype(np.float32)
+    if p0 is None:
+        return np.eye(3, dtype=np.float32)
 
-
-def estimate_affine_partial(prev_rgb01, cur_rgb01):
-    """
-    Retourne A (2x3) tel que: x_cur ~= A * x_prev (dans repère image)
-    """
-    prev_g = cv2.cvtColor((prev_rgb01 * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-    cur_g  = cv2.cvtColor((cur_rgb01  * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-
-    pts_prev = harris_points(prev_g, max_pts=500, quality=0.01, min_dist=7)
-    if pts_prev is None or len(pts_prev) < 20:
-        return None, 0.0
-
-    pts_cur, st, err = cv2.calcOpticalFlowPyrLK(
-        prev_g, cur_g,
-        pts_prev.reshape(-1, 1, 2),
-        None,
-        winSize=(21, 21),
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-    )
-
-    if pts_cur is None:
-        return None, 0.0
+    p1, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, p0, None)
+    if p1 is None or st is None:
+        return np.eye(3, dtype=np.float32)
 
     st = st.reshape(-1).astype(bool)
-    p0 = pts_prev[st]
-    p1 = pts_cur.reshape(-1, 2)[st]
+    p0 = p0[st].reshape(-1, 2)
+    p1 = p1[st].reshape(-1, 2)
 
-    if len(p0) < 15:
-        return None, 0.0
+    if len(p0) < 12:
+        return np.eye(3, dtype=np.float32)
 
-    A, inliers = cv2.estimateAffinePartial2D(
+    # affine partielle (rotation+translation+scale), robuste (RANSAC)
+    A, _inl = cv2.estimateAffinePartial2D(
         p0, p1,
         method=cv2.RANSAC,
-        ransacReprojThreshold=3.0,
+        ransacReprojThreshold=2.0,
         maxIters=2000,
         confidence=0.99,
         refineIters=10
     )
-    if A is None or inliers is None:
-        return None, 0.0
+    if A is None:
+        return np.eye(3, dtype=np.float32)
 
-    inlier_ratio = float(inliers.sum()) / float(len(inliers))
-    return A, inlier_ratio
-
-
-def affine2x3_to_3x3(A):
     M = np.eye(3, dtype=np.float32)
-    M[:2, :3] = A.astype(np.float32)
+    M[:2, :] = A.astype(np.float32)
     return M
 
+def build_overlap_correspondences(u_k, u_t, A_tk):
+    """
+    Construit Ω et Ω_{t,k} exactement comme (5)-(6) du papier.
 
-def warp_affine_rgb(img_rgb01, M_3x3, out_shape_hw):
+    u_k : image référence (float [0,1]) au temps k, shape (H,W,3)
+    u_t : image courante (float [0,1]) au temps t, shape (H,W,3)
+    A_tk : matrice 3x3 qui mappe coords de k -> t
+
+    Retourne:
+      - idx_x : indices linéaires des pixels x dans l'image k appartenant à Ω
+      - y_int : coords (x,y) entières correspondantes dans l'image t
+      - good_mask : booléen sur Ω, indiquant Ω_{t,k} (critère sigma)
     """
-    Warpe img avec la transfo M (3x3) (affine),
-    vers un canvas de taille out_shape_hw (h,w).
+    Hk, Wk = u_k.shape[:2]
+    Ht, Wt = u_t.shape[:2]
+
+    # Grille de points x dans l'image k
+    xs, ys = np.meshgrid(np.arange(Wk, dtype=np.float32),
+                         np.arange(Hk, dtype=np.float32))
+    ones = np.ones_like(xs)
+    pts = np.stack([xs, ys, ones], axis=-1).reshape(-1, 3).T  # (3, N)
+
+    # y = A_tk(x)
+    q = (A_tk @ pts)  # (3, N)
+    qx = q[0, :] / q[2, :]
+    qy = q[1, :] / q[2, :]
+
+    # Ω : points qui tombent dans l'image t
+    inside = (qx >= 0) & (qx <= (Wt - 1)) & (qy >= 0) & (qy <= (Ht - 1))
+    if not np.any(inside):
+        idx_x = np.array([], dtype=np.int64)
+        y_int = np.zeros((0, 2), dtype=np.int32)
+        good_mask = np.array([], dtype=bool)
+        return idx_x, y_int, good_mask
+
+    idx = np.where(inside)[0]
+    idx_x = idx.astype(np.int64)
+
+    # coords entières (papier : correspondance par A_tk(x), on quantifie pour échantillonner)
+    qx_i = np.rint(qx[inside]).astype(np.int32)
+    qy_i = np.rint(qy[inside]).astype(np.int32)
+    qx_i = np.clip(qx_i, 0, Wt - 1)
+    qy_i = np.clip(qy_i, 0, Ht - 1)
+    y_int = np.stack([qx_i, qy_i], axis=1)  # (M,2)
+
+    # (6) critère sigma sur la différence des couleurs centrées
+    # u_k^c(x) - mean(u_k^c)  vs  u_t^c(y) - mean(u_t^c)
+    mu_k = u_k.reshape(-1, 3).mean(axis=0)
+    mu_t = u_t.reshape(-1, 3).mean(axis=0)
+
+    # récupérer u_k(x) et u_t(y)
+    uk_flat = u_k.reshape(-1, 3)[idx_x]
+    yt_lin = (y_int[:, 1] * Wt + y_int[:, 0]).astype(np.int64)
+    ut_flat = u_t.reshape(-1, 3)[yt_lin]
+
+    dk = uk_flat - mu_k
+    dt = ut_flat - mu_t
+    # (1/3) sum_c (...)^2 < sigma^2
+    dist2 = np.mean((dk - dt) ** 2, axis=1)
+    good_mask = dist2 < (SIGMA ** 2)
+
+    return idx_x, y_int, good_mask
+
+def estimate_alpha_gamma_logLS(uk_vals, ut_vals, eps=1e-6):
     """
-    h, w = out_shape_hw
-    A = M_3x3[:2, :3]
-    out = cv2.warpAffine(
-        img_rgb01,
-        A,
-        (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0
-    )
+    Résout (3)-(4) du papier (régression linéaire en domaine log):
+      log(u_k) = gamma * log(u_t) + log(alpha)
+
+    uk_vals, ut_vals : vecteurs float [0,1] de même taille (sur Ω_{t,k})
+    """
+    uk = np.clip(uk_vals, eps, 1.0)
+    ut = np.clip(ut_vals, eps, 1.0)
+
+    x = np.log(ut)
+    y = np.log(uk)
+
+    x_mean = float(x.mean())
+    y_mean = float(y.mean())
+
+    vx = float(((x - x_mean) ** 2).mean())
+    if vx < 1e-12:
+        gamma = 1.0
+        alpha = float(np.exp(y_mean - gamma * x_mean))
+        return alpha, gamma
+
+    cov = float(((x - x_mean) * (y - y_mean)).mean())
+    gamma = cov / vx
+    alpha = float(np.exp(y_mean - gamma * x_mean))
+    return alpha, gamma
+
+def apply_parametric_correction_u8(frame_bgr_u8, alpha, gamma, lam):
+    """
+    Applique T'_t(u_t^c) = lam * alpha * (u_t^c)^gamma + (1-lam) * u_t^c
+    via LUT (papier : LUT pour rapidité).
+    alpha, gamma : arrays shape(3,) pour BGR
+    """
+    out = frame_bgr_u8.copy()
+    # LUT sur [0..255] -> [0..255]
+    x = np.arange(256, dtype=np.float32) / 255.0
+    for c in range(3):
+        y = lam * (alpha[c] * (x ** gamma[c])) + (1.0 - lam) * x
+        y = np.clip(y, 0.0, 1.0)
+        lut = (y * 255.0 + 0.5).astype(np.uint8)
+        out[:, :, c] = cv2.LUT(out[:, :, c], lut)
     return out
 
-
-# -------------------------
-# Masque Omega: correspondances robustes
-# -------------------------
-def omega_mask(ref_rgb01, warped_rgb01, sigma=0.04, eps=1e-6):
+def dominant_motion_vector(A_tk, W, H):
     """
-    Masque Omega basé sur différence centrée.
-    Implémentation simple: on centre chaque pixel par la moyenne globale (par canal),
-    puis on garde si ||(ref-mean(ref)) - (warped-mean(warped))||^2 < sigma^2
+    V_{t,k} : on prend le déplacement du centre (dominant motion) induit par A_tk.
     """
-    ref = ref_rgb01
-    w   = warped_rgb01
-
-    mr = ref.reshape(-1, 3).mean(axis=0)
-    mw = w.reshape(-1, 3).mean(axis=0)
-
-    dr = ref - mr
-    dw = w - mw
-    diff2 = np.sum((dr - dw) ** 2, axis=2)
-
-    mask = diff2 < (sigma ** 2)
-
-    # enlève les zones "vides" dues au warp (noires)
-    valid = np.sum(w, axis=2) > eps
-    mask = mask & valid
-    return mask
+    cx = (W - 1) * 0.5
+    cy = (H - 1) * 0.5
+    p = np.array([cx, cy, 1.0], dtype=np.float32)
+    q = A_tk @ p
+    qx = q[0] / q[2]
+    qy = q[1] / q[2]
+    vx = float(qx - cx)
+    vy = float(qy - cy)
+    return np.array([vx, vy], dtype=np.float32)
 
 
-# -------------------------
-# Estimation alpha/gamma par canal (régression en log)
-# -------------------------
-def fit_alpha_gamma(ref_rgb01, warped_rgb01, mask, eps=1e-6, gamma_clip=(0.2, 5.0)):
-    """
-    Pour chaque canal c:
-      log(ref) = a + gamma*log(warped)  => alpha = exp(a)
-    """
-    params = []
-    m = mask
+# =========================
+# Algorithme 1 (papier)
+# =========================
+def stabilize_video():
+    cap = cv2.VideoCapture(VIDEO_ORIG)
+    if not cap.isOpened():
+        raise RuntimeError(f"Impossible d'ouvrir {VIDEO_ORIG}")
 
-    for c in range(3):
-        y = ref_rgb01[..., c][m]
-        x = warped_rgb01[..., c][m]
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        if x.size < 200:  # trop peu d'échantillons
-            params.append((1.0, 1.0))
-            continue
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(VIDEO_STAB, fourcc, fps, (W, H))
+    if not writer.isOpened():
+        raise RuntimeError(f"Impossible d'écrire {VIDEO_STAB}")
 
-        x = np.clip(x, eps, 1.0)
-        y = np.clip(y, eps, 1.0)
+    # read first frame
+    ok, frame0 = cap.read()
+    if not ok:
+        raise RuntimeError("Vidéo vide ?")
 
-        lx = np.log(x)
-        ly = np.log(y)
+    # Alg.1 l.1-2
+    t = 1
+    k = 1
 
-        vx = np.var(lx)
-        if vx < 1e-8:
-            # fallback: gamma=1, alpha=ratio des moyennes (en linéaire)
-            alpha = float(np.mean(y) / (np.mean(x) + eps))
-            params.append((alpha, 1.0))
-            continue
+    out_prev = frame0.copy()
+    writer.write(out_prev)
 
-        cov = float(np.mean((lx - lx.mean()) * (ly - ly.mean())))
-        gamma = cov / (vx + 1e-12)
-        gamma = float(np.clip(gamma, gamma_clip[0], gamma_clip[1]))
+    # référence u_k (papier : u_k, initial = u_1)
+    u_k_full = out_prev.copy()
 
-        a = float(ly.mean() - gamma * lx.mean())
-        alpha = float(np.exp(a))
+    # versions low-res
+    u_k_lr = resize_keep_aspect(u_k_full, WORK_W)
+    prev_lr = resize_keep_aspect(frame0, WORK_W)
 
-        params.append((alpha, gamma))
+    # A_{t,k} (k->t) en homogène
+    A_tk = np.eye(3, dtype=np.float32)
 
-    return params  # [(alphaR,gammaR), (alphaG,gammaG), (alphaB,gammaB)]
+    # param p de (7)
+    p_norm = float(max(u_k_lr.shape[1], u_k_lr.shape[0]))
 
+    # boucle principale (Alg.1)
+    while True:
+        ok, frame_t = cap.read()
+        if not ok:
+            break
+        t += 1
 
-def apply_tonal_transform(frame_rgb01, params, lam=1.0):
-    """
-    Applique T'(s)=lam*(alpha*s^gamma) + (1-lam)*s par canal.
-    """
-    out = np.empty_like(frame_rgb01)
-    s = frame_rgb01
-    for c in range(3):
-        alpha, gamma = params[c]
-        corrected = alpha * np.power(np.clip(s[..., c], 0.0, 1.0), gamma)
-        out[..., c] = lam * corrected + (1.0 - lam) * s[..., c]
-    return np.clip(out, 0.0, 1.0)
+        # low-res courant
+        curr_lr = resize_keep_aspect(frame_t, WORK_W)
 
+        # mouvement dominant entre (t-1)->t (sur low-res)
+        prev_gray = cv2.cvtColor(prev_lr, cv2.COLOR_BGR2GRAY)
+        curr_gray = cv2.cvtColor(curr_lr, cv2.COLOR_BGR2GRAY)
+        A_tt1 = estimate_affine_dominant_motion(prev_gray, curr_gray)
 
-# -------------------------
-# Boucle principale: stabilisation tonale
-# -------------------------
-def stabilize_tone_from_images(
-    folder,
-    fps=30,
-    out_path="stabilized.mp4",
-    est_width=160,
-    omega_thresh=0.25,     # ω
-    sigma=0.04,
-    lambda0=0.9,
-    p_motion=30.0,         # + grand => moins sensible au mouvement
-    max_frames=None,
-):
-    paths = list_images(folder)
-    if not paths:
-        raise FileNotFoundError(f"Aucune image trouvée dans {folder}")
+        # composition : A_{t,k} = A_{t,t-1} o A_{t-1,k}
+        A_tk = (A_tt1 @ A_tk).astype(np.float32)
 
-    if max_frames is not None:
-        paths = paths[:max_frames]
+        # (4) Calculer Ω_{t,k} via (5)-(6)
+        u_k_lr_f = to_float01(u_k_lr)
+        u_t_lr_f = to_float01(curr_lr)
 
-    # Lire première frame
-    f0 = read_image_float01(paths[0])
-    if f0 is None:
-        raise RuntimeError(f"Impossible de lire {paths[0]}")
+        idx_x, y_int, good = build_overlap_correspondences(u_k_lr_f, u_t_lr_f, A_tk)
 
-    # Référence k (corrigée) + version estimation
-    ref_full = f0.copy()
-    ref_est = resize_for_estimation(ref_full, est_width)
+        Omega_size = int(len(idx_x))                 # |Ω|
+        Omega_tk_size = int(np.count_nonzero(good))  # |Ω_{t,k}|
 
-    # pour composer les affines (référence -> courant)
-    # Ici on garde une matrice C telle que x_cur ~= C * x_ref (dans repère estimation)
-    C_ref_to_prev = np.eye(3, dtype=np.float32)
+        # (5) test |Ω_{t,k}| >= ω * |Ω|
+        if Omega_size > 0 and Omega_tk_size >= int(math.ceil(OMEGA_FRAC * Omega_size)):
+            # (6-9) estimer alpha/gamma par canal + appliquer correction
+            # construire les paires (x,y) dans Ω_{t,k}
+            idx_good = np.where(good)[0]
+            idx_x_good = idx_x[idx_good]
 
-    outputs = [ref_full.copy()]
-    prev_est = ref_est.copy()
-    prev_full = ref_full.copy()
+            Ht_lr, Wt_lr = u_t_lr_f.shape[:2]
+            yt = y_int[idx_good]
+            yt_lin = (yt[:, 1] * Wt_lr + yt[:, 0]).astype(np.int64)
 
-    for i in range(1, len(paths)):
-        cur_full = read_image_float01(paths[i])
-        if cur_full is None:
-            print(f"[WARN] Skip unreadable: {paths[i]}")
-            continue
+            uk_flat = u_k_lr_f.reshape(-1, 3)[idx_x_good]
+            ut_flat = u_t_lr_f.reshape(-1, 3)[yt_lin]
 
-        cur_est = resize_for_estimation(cur_full, est_width)
+            # (7) lambda
+            V = dominant_motion_vector(A_tk, Wt_lr, Ht_lr)
+            vnorm = float(np.linalg.norm(V))
+            lam = float(LAMBDA0 * math.exp(-vnorm / max(1e-6, p_norm)))
+            lam = max(0.0, min(1.0, lam))
 
-        # 1) Mouvement entre prev_est et cur_est
-        A_2x3, inlier_ratio = estimate_affine_partial(prev_est, cur_est)
-        if A_2x3 is None:
-            # si on n'a pas de mouvement, on tente sans warp
-            A_3x3 = np.eye(3, dtype=np.float32)
+            alpha = np.zeros(3, dtype=np.float32)
+            gamma = np.zeros(3, dtype=np.float32)
+
+            # IMPORTANT : OpenCV est en BGR, le papier note {r,g,b}
+            # on applique canal par canal, l'ordre n'importe pas ici tant qu'on est cohérent
+            for c in range(3):
+                a, g = estimate_alpha_gamma_logLS(uk_flat[:, c], ut_flat[:, c])
+                alpha[c] = a
+                gamma[c] = g
+
+            out_t = apply_parametric_correction_u8(frame_t, alpha, gamma, lam)
+            writer.write(out_t)
+
+            # mise à jour (t devient t-1 pour le prochain tour)
+            out_prev = out_t
+            prev_lr = curr_lr
+
         else:
-            A_3x3 = affine2x3_to_3x3(A_2x3)
+            # (11-14) changement de référence
+            # k <- t-1 ; u_k <- T'_{t-1}(u_{t-1})
+            k = t - 1
+            u_k_full = out_prev.copy()
+            u_k_lr = resize_keep_aspect(u_k_full, WORK_W)
 
-        # Compose: x_cur = A(prev->cur) * x_prev, et x_prev = C(ref->prev) * x_ref
-        C_ref_to_cur = A_3x3 @ C_ref_to_prev
+            # reset A_{t-1,k} = I puisque k=t-1 => pour recalculer Ω_{t,k},
+            # on veut A_{t,k} = A_{t,t-1}
+            A_tk = np.eye(3, dtype=np.float32)
 
-        # 2) Warp du courant vers ref: on veut x_ref = inv(C) * x_cur
-        C_cur_to_ref = np.linalg.inv(C_ref_to_cur)
+            # on NE consomme PAS une nouvelle frame ici dans le papier :
+            # on doit re-tester le *même* t avec le nouveau k.
+            # Donc on annule les effets "avance" et on ré-évalue avec k=t-1:
+            # -> on force A_tk = A_tt1 et on refait le test une fois.
 
-        h_est, w_est = ref_est.shape[:2]
-        warped_est = warp_affine_rgb(cur_est, C_cur_to_ref, (h_est, w_est))
+            A_tk = A_tt1.copy()
 
-        # 3) Masque Omega
-        mask = omega_mask(ref_est, warped_est, sigma=sigma)
-        ratio = float(mask.mean())
+            u_k_lr_f = to_float01(u_k_lr)
+            u_t_lr_f = to_float01(curr_lr)
 
-        # 4) Si pas assez de correspondances, change la référence
-        if ratio < omega_thresh:
-            # nouvelle référence = frame précédente déjà corrigée
-            ref_full = outputs[-1].copy()
-            ref_est = resize_for_estimation(ref_full, est_width)
+            idx_x, y_int, good = build_overlap_correspondences(u_k_lr_f, u_t_lr_f, A_tk)
+            Omega_size = int(len(idx_x))
+            Omega_tk_size = int(np.count_nonzero(good))
 
-            # reset composition
-            C_ref_to_cur = np.eye(3, dtype=np.float32)
-            C_cur_to_ref = np.eye(3, dtype=np.float32)
+            if Omega_size > 0 and Omega_tk_size >= int(math.ceil(OMEGA_FRAC * Omega_size)):
+                idx_good = np.where(good)[0]
+                idx_x_good = idx_x[idx_good]
 
-            # recalcul warp/mask (optionnel, ici on continue direct)
-            warped_est = cur_est.copy()
-            mask = np.ones((ref_est.shape[0], ref_est.shape[1]), dtype=bool)
-            ratio = 1.0
+                Ht_lr, Wt_lr = u_t_lr_f.shape[:2]
+                yt = y_int[idx_good]
+                yt_lin = (yt[:, 1] * Wt_lr + yt[:, 0]).astype(np.int64)
 
-        # 5) Estimation alpha/gamma sur low-res (ref_est vs warped_est)
-        params = fit_alpha_gamma(ref_est, warped_est, mask)
+                uk_flat = u_k_lr_f.reshape(-1, 3)[idx_x_good]
+                ut_flat = u_t_lr_f.reshape(-1, 3)[yt_lin]
 
-        # 6) Viscosité lambda en fonction du mouvement (approx: translation du C_ref_to_cur)
-        tx = float(C_ref_to_cur[0, 2])
-        ty = float(C_ref_to_cur[1, 2])
-        motion_norm = np.sqrt(tx * tx + ty * ty)
-        lam = float(lambda0 * np.exp(-motion_norm / max(p_motion, 1e-6)))
-        lam = float(np.clip(lam, 0.0, 1.0))
+                V = dominant_motion_vector(A_tk, Wt_lr, Ht_lr)
+                vnorm = float(np.linalg.norm(V))
+                lam = float(LAMBDA0 * math.exp(-vnorm / max(1e-6, p_norm)))
+                lam = max(0.0, min(1.0, lam))
 
-        # 7) Appliquer T' sur full-res
-        out_full = apply_tonal_transform(cur_full, params, lam=lam)
+                alpha = np.zeros(3, dtype=np.float32)
+                gamma = np.zeros(3, dtype=np.float32)
+                for c in range(3):
+                    a, g = estimate_alpha_gamma_logLS(uk_flat[:, c], ut_flat[:, c])
+                    alpha[c] = a
+                    gamma[c] = g
 
-        outputs.append(out_full)
+                out_t = apply_parametric_correction_u8(frame_t, alpha, gamma, lam)
+            else:
+                # si même avec k=t-1 ça ne passe pas, on n'applique rien (cas dégénéré)
+                out_t = frame_t.copy()
 
-        # update prev
-        prev_est = cur_est
-        prev_full = cur_full
-        C_ref_to_prev = C_ref_to_cur
+            writer.write(out_t)
 
-        if i % 20 == 0 or i == len(paths) - 1:
-            print(f"[{i}/{len(paths)-1}] Omega={ratio:.3f}  inliers={inlier_ratio:.2f}  lam={lam:.3f}")
+            out_prev = out_t
+            prev_lr = curr_lr
 
-    write_mp4(outputs, out_path, fps)
-    return outputs
+            # pour la suite, la référence est bien celle du papier :
+            u_k_full = out_prev.copy()
+            u_k_lr = resize_keep_aspect(u_k_full, WORK_W)
+            A_tk = np.eye(3, dtype=np.float32)
+
+    cap.release()
+    writer.release()
+    print("OK ->", VIDEO_STAB)
 
 
-# -------------------------
-# Main
-# -------------------------
 if __name__ == "__main__":
-    SESSION_FOLDER = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/Images_graycard"
-    OUT_MP4 = "/Users/louisdorlencourt/Documents/Documents/3A/TIVO/graycard_stabilized.mp4"
-
-    stabilize_tone_from_images(
-        folder=SESSION_FOLDER,
-        fps=50,
-        out_path=OUT_MP4,
-        est_width=160,
-        omega_thresh=0.55,
-        sigma=0.05,
-        lambda0=0.9,
-        p_motion=30.0,
-        max_frames=None
-    )
+    stabilize_video()
